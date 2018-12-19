@@ -7,11 +7,5 @@ We use the Grad-CAM and pyramid to find an confusion feature map for looking the
 ## Demo
 
 <div style="color:#0000FF" align="center">
-	the Gradient pyramid network
-<img src="./net.png" width="600"/> 
-</div>
-
-<div style="color:#0000FF" align="center">
-	some results
-<img src="./result.jpg" width="600"/> 
+<img src="./result.jpg" width="800"/> 
 </div>
