@@ -5,6 +5,7 @@ import torch
 import traceback
 from torch.autograd import Variable
 from torch.autograd import Function
+import xml.etree.ElementTree as ET
 from torchvision import models
 from torchvision import utils
 import numpy as np
@@ -213,7 +214,11 @@ def visualize_label(img, boxes, path, color=(0, 255, 0)):
     """
     boxes = np.array(boxes).reshape(-1, 4, 2)
     img = np.ascontiguousarray(img)
-    cv2.drawContours(img, boxes, -1, color, thickness=1)
+    #xmin, ymin = boxes.min(1)[0]
+    #xmax, ymax = boxes.max(1)[0]
+    #x,y,w,h = boxes[0][1][0],boxes[0][1][1],xmax-xmin,ymax-ymin
+    cv2.drawContours(img, boxes, -1, color, thickness=2)
+    #cv2.rectangle(img,(x,y),(x+w,y+h),color,2)
     # return img
     cv2.imwrite(path, img * 255)
 
@@ -228,30 +233,82 @@ def show_cam_on_image(img, mask, path):
 def checkpoint(box, origin_ratio):
     
     h_ratio, w_ratio = origin_ratio
-
     box = np.array(box).reshape(-1, 4, 2)
     xmin, ymin = box.min(1)[0]
     xmax, ymax = box.max(1)[0]
     xmin,ymin,xmax,ymax = np.max((xmin,0)),np.max((ymin,0)),np.min((xmax,224)),np.min((ymax,224))
     xmin,ymin,xmax,ymax = int(xmin * w_ratio), int(ymin * h_ratio), int(xmax * w_ratio), int(ymax * h_ratio)
     return str(xmin), str(ymin), str(xmax), str(ymax)
+
+def cal_IOU(box1, box2):
+    """
+    box1, box2: list or numpy array of size 4*2 or 8, h_index first
+    """
+    box1 = [box1[0], box1[1], box1[2], box1[1], box1[2], box1[3], box1[0], box1[3]]
+    box2 = [box2[0], box2[1], box2[2], box2[1], box2[2], box2[3], box2[0], box2[3]]
+
+    box1 = np.array(box1, dtype=np.int).reshape([1, 4, 2])
+    box2 = np.array(box2, dtype=np.int).reshape([1, 4, 2])
+    box1_max = box1.max(axis=1)
+    box2_max = box2.max(axis=1)
+    w_max = int(max(box1_max[0][0], box2_max[0][0]))
+    h_max = int(max(box1_max[0][1], box2_max[0][1]))
+    canvas = np.zeros((h_max + 1, w_max + 1))
+    # print(canvas.shape)
+    box1_canvas = canvas.copy()
+    box1_area = np.sum(cv2.drawContours(box1_canvas, box1, -1, 1, thickness=-1))
+    # print(box1_area)
+    box2_canvas = canvas.copy()
+    box2_area = np.sum(cv2.drawContours(box2_canvas, box2, -1, 1, thickness=-1))
+    # print(box2_area)
+    cv2.drawContours(canvas, box1, -1, 1, thickness=-1)
+    cv2.drawContours(canvas, box2, -1, 1, thickness=-1)
+    union = np.sum(canvas)
+    intersction = box1_area + box2_area - union
+    return intersction / union
+
+def _load_pascal_annotation(filename):
+    tree = ET.parse(filename)
+    objs = tree.findall('object')
+    objects = list()
+    # Load object bounding boxes into a data frame.
+    for ix, obj in enumerate(objs):
+        bbox = obj.find('bndbox')
+        # Make pixel indexes 0-based
+        x1 = float(bbox.find('xmin').text)
+        y1 = float(bbox.find('ymin').text)
+        x2 = float(bbox.find('xmax').text)
+        y2 = float(bbox.find('ymax').text)
+        class_name = obj.find('name').text.lower().strip()
+        objects.append([x1, y1, x2, y2, class_name])
+    return objects
+
+def vis_bbox(im, gt, rect, path):
     
+    rect[1] = int(rect[1]) 
+    rect[2] = int(rect[2]) 
+    rect[3] = int(rect[3]) 
+    rect[4] = int(rect[4])
+    cv2.rectangle(im, (rect[1], rect[2]), (rect[3], rect[4]), (204, 0, 0), 4)
+    cv2.putText(im, '%s' % ("ROIs"), (rect[1], rect[2] + 15), cv2.FONT_HERSHEY_PLAIN, 2.0, (204, 0, 0), thickness=2)
+    
+    cv2.rectangle(im, (int(gt[0]), int(gt[1])), (int(gt[2]), int(gt[3])), (0, 0, 255), 4)
+    cv2.putText(im, '%s' % ("ground truth"), (int(gt[0]), int(gt[1]) + 15), cv2.FONT_HERSHEY_PLAIN, 2.0, (0, 0, 255), thickness=2)
+    
+    cv2.imwrite(path, im)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--cuda', type= bool, default=True, help='Use NVIDIA GPU acceleration')
     parser.add_argument('--gpus', type=str, default="2", help="default GPU devices (0,1)")
     parser.add_argument('--target_layer', type=list, default=["8", "17", "26", "35"], help="default GPU devices (0,1)")#"8", "17", "26", "35", 
-    parser.add_argument('--result-path', type=str, default='./', help='Input image path')
-    parser.add_argument('--image-path', type=str, default='./', help='Input image path')
+    parser.add_argument('--result-path', type=str, default='./vgg19_bbox_result', help='Input image path')
+    parser.add_argument('--ground-truth-path', type=str, default='./val', help='Input image path')
+    
+    parser.add_argument('--image-path', type=str, default='./dataset', help='Input image path')
     
     args = parser.parse_args()
     
-    
-#    for name, module in model.layer1[-1]._modules.items():
-#        print(name)
-#    exit()
-   
     if args.cuda:
         print("=====> use gpu id: '{}'".format(args.gpus))
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
@@ -265,58 +322,82 @@ if __name__ == '__main__':
     
     image_list = glob.glob(os.path.join(args.image_path, "*.JPEG"))
     
+    if not os.path.exists(args.result_path):
+        os.makedirs(args.result_path)
     
-    for num, image_path in enumerate(image_list):
+    #writer = open(os.path.join(args.result_path, "submission.txt"), "a")
+    
+    logger = open(os.path.join(args.result_path, "log.txt"), "a")
+    
+    for num, image_path in enumerate(sorted(image_list)):
         
         try:
-            image_name = image_path.replace(args.image_path, "").replace(".JPEG", "")
-                
-            result_img_dir = os.path.join(args.result_path, image_name) 
+            # get the gradient model
+            grad_cam = GradCam(model=models.vgg19(pretrained=True), target_layer_names=args.target_layer, device=device)
             
+            image_name = image_path.replace(args.image_path+"/", "").replace(".JPEG", "")
+            
+            xml_name = image_name + ".xml"
+            
+            result_img_dir = args.result_path
             
             if not os.path.exists(result_img_dir):
                 os.makedirs(result_img_dir)
             
-            
             img = cv2.imread(image_path, 1)
+            
+            img_ = img.copy()
             
             origin_ratio = (img.shape[0] / 224, img.shape[1] / 224)
             
             img = np.float32(cv2.resize(img, (224, 224))) / 255
             
-            cv2.imwrite(os.path.join(result_img_dir, "source.jpg"), img * 255)
+            #cv2.imwrite(os.path.join(result_img_dir, image_name+"_source.jpg"), img * 255)
             
-            for layer in range(len(args.target_layer)):
-                # get the gradient model
-                grad_cam = GradCam(model=models.vgg19(pretrained=True), target_layer_names=args.target_layer[layer], device=device)
-                gb_model = GuidedBackpropReLUModel(model=models.vgg19(pretrained=True), device=device)
-                
-                input = preprocess_image(img)
-                
-                # If None, returns the map for the highest scoring category(top one).
-                # Otherwise, returns the top5 category. the bbox is gotten by top to low.
-                bboxs = grad_cam(input, topk=5)
-                
-                cam = np.zeros(img.shape[:-1], dtype=np.float32)
-                
-                ROIs = list()
-                
-                for i, bbox in enumerate(bboxs):
-                    if i == 0:
-                        show_cam_on_image(img.copy(), bbox["mask"], os.path.join(result_img_dir, str(args.target_layer[layer]) + "_" + str(i) + "_" + image_name + "_cam.jpg"))
-                        visualize_label(img.copy(), bbox["bbox"], os.path.join(result_img_dir, str(args.target_layer[layer]) + "_" + str(i) + "_" + image_name + "_bbox.jpg"))
-                        gb = gb_model(input, index=None)
-                        utils.save_image(torch.from_numpy(gb), os.path.join(result_img_dir, str(args.target_layer[layer]) + "_" + str(i) + "_" + image_name + "_gb.jpg"))
-                        cam_mask = np.zeros(gb.shape)
-                        for i in range(0, gb.shape[0]):
-                            cam_mask[i, :, :] = bbox["mask"]
-                        cam_gb = np.multiply(cam_mask, gb)
-                        utils.save_image(torch.from_numpy(cam_gb), os.path.join(result_img_dir, str(args.target_layer[layer]) + "_" + str(i) + "_" + image_name + "_cam_gb.jpg"))
-                        ROIs.append(str(bbox["classify"]))
-                        ROIs = ROIs + list(checkpoint(bbox["bbox"], origin_ratio))
-                        cam = np.array((cam, bbox["mask"])).max(axis=0)
+            input = preprocess_image(img)
+            
+            # If None, returns the map for the highest scoring category(top one).
+            # Otherwise, returns the top5 category. the bbox is gotten by top to low.
+            bboxs = grad_cam(input, topk=5)
+            
+            cam = np.zeros(img.shape[:-1], dtype=np.float32)
+            
+            ROIs = list()
+            
+            for i, bbox in enumerate(bboxs):
+                if i == 0:
+                    #show_cam_on_image(img.copy(), bbox["mask"], os.path.join(result_img_dir, "top_" + str(i) + "_" + image_name + "_cam.jpg"))
+                    #visualize_label(img.copy(), bbox["bbox"], os.path.join(result_img_dir, "top_" + str(i) + "_" + image_name + "_bbox.jpg"))
+                    ROIs.append(str(bbox["classify"]))
+                    ROIs = ROIs + list(checkpoint(bbox["bbox"], origin_ratio))
+                    cam = np.array((cam, bbox["mask"])).max(axis=0)
                     
+                    ROIs_copy = ROIs.copy()
+                    ground_truth = _load_pascal_annotation(os.path.join(args.ground_truth_path, xml_name))
+                    
+                    if len(ground_truth) > 1:
+                        logger.write(xml_name + " " + str(len(ground_truth)) +"\n")
+                    
+                    for gt in ground_truth:
+                        #cv2.imwrite(os.path.join(result_img_dir, image_name+"_source.jpg"), img_)
+                        
+                        if cal_IOU(gt, ROIs_copy) >= 0.5:
+                            vis_bbox(img_, gt, ROIs_copy, os.path.join(result_img_dir, image_name + "_bbox.jpg"))
+                            break
+                        else:
+                            continue
+                    
+                else:
+                    #show_cam_on_image(img.copy(), bbox["mask"], os.path.join(result_img_dir, "top_" + str(i) + "_" + image_name + "_cam.jpg"))
+                    #visualize_label(img.copy(), bbox["bbox"], os.path.join(result_img_dir, "top_" + str(i) + "_" + image_name + "_bbox.jpg"))
+                    #ROIs.append(str(bbox["classify"]))
+                    #ROIs = ROIs + list(checkpoint(bbox["bbox"], origin_ratio))
+                    #cam = np.array((cam, bbox["mask"])).max(axis=0)
+                    pass
+            
+            #writer.write(" ".join(ROIs)+"\n")
+            #show_cam_on_image(img.copy(), cam, os.path.join(result_img_dir, image_name + "_all_cam.jpg"))
             print(num, image_name + ".JPEG is finished!")
-            #exit()
+            
         except Exception as e:
             traceback.print_exc()

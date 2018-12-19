@@ -27,7 +27,10 @@ class FeatureExtractor():
         outputs = []
         self.gradients = []
         for name, module in self.model._modules.items():
+            if name == "fc":
+                x = x.view(x.size(0), -1)
             x = module(x)
+            
             if name in self.target_layers:
                 x.register_hook(self.save_gradient)
                 outputs += [x]
@@ -42,15 +45,13 @@ class ModelOutputs():
 
     def __init__(self, model, target_layers):
         self.model = model
-        self.feature_extractor = FeatureExtractor(self.model.features, target_layers)
+        self.feature_extractor = FeatureExtractor(self.model, target_layers)
 
     def get_gradients(self):
         return self.feature_extractor.gradients
 
     def __call__(self, x):
         target_activations, output = self.feature_extractor(x)
-        output = output.view(output.size(0), -1)
-        output = self.model.classifier(output)
         return target_activations, output
 
 
@@ -97,8 +98,9 @@ class GradCam:
             
             one_hot = torch.sum(one_hot.to(device) * output)
             
-            self.model.features.zero_grad()
-            self.model.classifier.zero_grad()
+            #self.model.features.zero_grad()
+            #self.model.classifier.zero_grad()
+            self.model.zero_grad()
             
             one_hot.backward(retain_graph=True)
             
@@ -139,71 +141,18 @@ class GradCam:
             ret, binary = cv2.threshold(mask, shreld, 255, cv2.THRESH_BINARY)
             
             _, contours, hierarcy = cv2.findContours(binary.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-            c = sorted(contours, key=cv2.contourArea, reverse=True)[0]
-            # compute the rotated bounding box of the largest contour
-            rect = cv2.minAreaRect(c)
-            box = np.int0(cv2.boxPoints(rect))
             
+            cont_ = sorted(contours, key=cv2.contourArea, reverse=True)
+            
+            if len(cont_) == 0:
+                box = np.zeros((4,2), dtype=int)
+            else:
+                c = cont_[0]
+                # compute the rotated bounding box of the largest contour
+                rect = cv2.minAreaRect(c)
+                box = np.int0(cv2.boxPoints(rect))
             bboxes_top.append({"classify":index, "bbox":box, "mask":mask_copy})
-            
         return bboxes_top
-
-
-class GuidedBackpropReLU(Function):
-    def forward(self, input):
-        positive_mask = (input > 0).type_as(input)
-        output = torch.addcmul(torch.zeros(input.size()).type_as(input), input, positive_mask)
-        self.save_for_backward(input, output)
-        return output
-
-    def backward(self, grad_output):
-        input, output = self.saved_tensors
-        grad_input = None
-
-        positive_mask_1 = (input > 0).type_as(grad_output)
-        positive_mask_2 = (grad_output > 0).type_as(grad_output)
-        grad_input = torch.addcmul(torch.zeros(input.size()).type_as(input),
-                                   torch.addcmul(torch.zeros(input.size()).type_as(input), grad_output,
-                                                 positive_mask_1), positive_mask_2)
-
-        return grad_input
-
-
-class GuidedBackpropReLUModel:
-    def __init__(self, model, device):
-        self.model = model
-        self.model.eval()
-
-        self.model = model.to(device)
-
-        # replace ReLU with GuidedBackpropReLU
-        for idx, module in self.model.features._modules.items():
-            if module.__class__.__name__ == 'ReLU':
-                self.model.features._modules[idx] = GuidedBackpropReLU()
-
-    def forward(self, input):
-        return self.model(input)
-
-    def __call__(self, input, index=None):
-        
-        output = self.forward(input.to(device))
-
-        if index == None:
-            index = np.argmax(output.cpu().data.numpy())
-
-        one_hot = np.zeros((1, output.size()[-1]), dtype=np.float32)
-        one_hot[0][index] = 1
-        one_hot = Variable(torch.from_numpy(one_hot), requires_grad=True)
-        
-        one_hot = torch.sum(one_hot.to(device) * output)
-        
-
-        # self.model.features.zero_grad()
-        # self.model.classifier.zero_grad()
-        one_hot.backward(retain_graph=True)
-        output = input.grad.cpu().data.numpy()
-        output = output[0, :, :, :]
-        return output
 
 
 def visualize_label(img, boxes, path, color=(0, 255, 0)):
@@ -213,8 +162,9 @@ def visualize_label(img, boxes, path, color=(0, 255, 0)):
     """
     boxes = np.array(boxes).reshape(-1, 4, 2)
     img = np.ascontiguousarray(img)
-    cv2.drawContours(img, boxes, -1, color, thickness=1)
-    # return img
+    
+    cv2.drawContours(img, boxes, -1, color, thickness=2)
+    
     cv2.imwrite(path, img * 255)
 
 
@@ -228,7 +178,6 @@ def show_cam_on_image(img, mask, path):
 def checkpoint(box, origin_ratio):
     
     h_ratio, w_ratio = origin_ratio
-
     box = np.array(box).reshape(-1, 4, 2)
     xmin, ymin = box.min(1)[0]
     xmax, ymax = box.max(1)[0]
@@ -236,22 +185,28 @@ def checkpoint(box, origin_ratio):
     xmin,ymin,xmax,ymax = int(xmin * w_ratio), int(ymin * h_ratio), int(xmax * w_ratio), int(ymax * h_ratio)
     return str(xmin), str(ymin), str(xmax), str(ymax)
     
+def visualize(img, boxes, path, color=(0, 255, 0)):
+    
+    xmin, ymin, xmax, ymax =  boxes
+    img = np.ascontiguousarray(img)
+    
+    x,y,w,h = int(xmin), int(ymin), int(xmax)-int(xmin), int(ymax)-int(ymin) 
+    #cv2.drawContours(img, boxes, -1, color, thickness=2)
+    cv2.rectangle(img,(x,y),(x+w,y+h),color,2)
+    # return img
+    cv2.imwrite(path, img)
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--cuda', type= bool, default=True, help='Use NVIDIA GPU acceleration')
     parser.add_argument('--gpus', type=str, default="2", help="default GPU devices (0,1)")
-    parser.add_argument('--target_layer', type=list, default=["8", "17", "26", "35"], help="default GPU devices (0,1)")#"8", "17", "26", "35", 
-    parser.add_argument('--result-path', type=str, default='./', help='Input image path')
-    parser.add_argument('--image-path', type=str, default='./', help='Input image path')
+    parser.add_argument('--target_layer', type=list, default=["layer1", "layer2", "layer3", "layer4"], help="default GPU devices (0,1)")#"8", "17", "26", "35", 
+    parser.add_argument('--result-path', type=str, default='./Resnet101_result', help='Input image path')
+    parser.add_argument('--image-path', type=str, default='./dataset', help='Input image path')
     
     args = parser.parse_args()
     
-    
-#    for name, module in model.layer1[-1]._modules.items():
-#        print(name)
-#    exit()
-   
     if args.cuda:
         print("=====> use gpu id: '{}'".format(args.gpus))
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
@@ -265,58 +220,62 @@ if __name__ == '__main__':
     
     image_list = glob.glob(os.path.join(args.image_path, "*.JPEG"))
     
+    if not os.path.exists(args.result_path):
+        os.makedirs(args.result_path)
     
-    for num, image_path in enumerate(image_list):
+    writer = open(os.path.join(args.result_path, "submission.txt"), "a")
+    
+    for num, image_path in enumerate(sorted(image_list)):
         
         try:
-            image_name = image_path.replace(args.image_path, "").replace(".JPEG", "")
-                
-            result_img_dir = os.path.join(args.result_path, image_name) 
+            # get the gradient model
+            grad_cam = GradCam(model=models.resnet101(pretrained=True), target_layer_names=args.target_layer, device=device)
             
+            image_name = image_path.replace(args.image_path+"/", "").replace(".JPEG", "")
+            
+            result_img_dir = args.result_path
             
             if not os.path.exists(result_img_dir):
                 os.makedirs(result_img_dir)
             
-            
             img = cv2.imread(image_path, 1)
+            
+            img_ = img.copy()
             
             origin_ratio = (img.shape[0] / 224, img.shape[1] / 224)
             
             img = np.float32(cv2.resize(img, (224, 224))) / 255
             
-            cv2.imwrite(os.path.join(result_img_dir, "source.jpg"), img * 255)
+            cv2.imwrite(os.path.join(result_img_dir, image_name+"_source.jpg"), img * 255)
             
-            for layer in range(len(args.target_layer)):
-                # get the gradient model
-                grad_cam = GradCam(model=models.vgg19(pretrained=True), target_layer_names=args.target_layer[layer], device=device)
-                gb_model = GuidedBackpropReLUModel(model=models.vgg19(pretrained=True), device=device)
-                
-                input = preprocess_image(img)
-                
-                # If None, returns the map for the highest scoring category(top one).
-                # Otherwise, returns the top5 category. the bbox is gotten by top to low.
-                bboxs = grad_cam(input, topk=5)
-                
-                cam = np.zeros(img.shape[:-1], dtype=np.float32)
-                
-                ROIs = list()
-                
-                for i, bbox in enumerate(bboxs):
-                    if i == 0:
-                        show_cam_on_image(img.copy(), bbox["mask"], os.path.join(result_img_dir, str(args.target_layer[layer]) + "_" + str(i) + "_" + image_name + "_cam.jpg"))
-                        visualize_label(img.copy(), bbox["bbox"], os.path.join(result_img_dir, str(args.target_layer[layer]) + "_" + str(i) + "_" + image_name + "_bbox.jpg"))
-                        gb = gb_model(input, index=None)
-                        utils.save_image(torch.from_numpy(gb), os.path.join(result_img_dir, str(args.target_layer[layer]) + "_" + str(i) + "_" + image_name + "_gb.jpg"))
-                        cam_mask = np.zeros(gb.shape)
-                        for i in range(0, gb.shape[0]):
-                            cam_mask[i, :, :] = bbox["mask"]
-                        cam_gb = np.multiply(cam_mask, gb)
-                        utils.save_image(torch.from_numpy(cam_gb), os.path.join(result_img_dir, str(args.target_layer[layer]) + "_" + str(i) + "_" + image_name + "_cam_gb.jpg"))
-                        ROIs.append(str(bbox["classify"]))
-                        ROIs = ROIs + list(checkpoint(bbox["bbox"], origin_ratio))
-                        cam = np.array((cam, bbox["mask"])).max(axis=0)
-                    
+            input = preprocess_image(img)
+            
+            # If None, returns the map for the highest scoring category(top one).
+            # Otherwise, returns the top5 category. the bbox is gotten by top to low.
+            bboxs = grad_cam(input, topk=5)
+            
+            cam = np.zeros(img.shape[:-1], dtype=np.float32)
+            
+            ROIs = list()
+            
+            for i, bbox in enumerate(bboxs):
+                if i == 0:
+                    show_cam_on_image(img.copy(), bbox["mask"], os.path.join(result_img_dir, "top_" + str(i) + "_" + image_name + "_cam.jpg"))
+                    visualize_label(img.copy(), bbox["bbox"], os.path.join(result_img_dir, "top_" + str(i) + "_" + image_name + "_bbox.jpg"))
+                    ROIs.append(str(bbox["classify"]))
+                    ROIs = ROIs + list(checkpoint(bbox["bbox"], origin_ratio))
+                    cam = np.array((cam, bbox["mask"])).max(axis=0)
+                    #visualize_label(img_.copy(), bbox["bbox"], os.path.join(result_img_dir, "top_" + str(i) + "_" + image_name + "_source_bbox.jpg"))
+                else:
+                    show_cam_on_image(img.copy(), bbox["mask"], os.path.join(result_img_dir, "top_" + str(i) + "_" + image_name + "_cam.jpg"))
+                    visualize_label(img.copy(), bbox["bbox"], os.path.join(result_img_dir, "top_" + str(i) + "_" + image_name + "_bbox.jpg"))
+                    ROIs.append(str(bbox["classify"]))
+                    ROIs = ROIs + list(checkpoint(bbox["bbox"], origin_ratio))
+                    cam = np.array((cam, bbox["mask"])).max(axis=0)
+            
+            writer.write(" ".join(ROIs)+"\n")
+            show_cam_on_image(img.copy(), cam, os.path.join(result_img_dir, image_name + "_all_cam.jpg"))
             print(num, image_name + ".JPEG is finished!")
-            #exit()
+            exit()
         except Exception as e:
             traceback.print_exc()
